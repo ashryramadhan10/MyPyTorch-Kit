@@ -17,7 +17,7 @@ class Discriminator(nn.Module):
             nn.Sigmoid() # N x 1 x 1 x 1
         )
 
-
+    # CEIL([(F + 2P - K) / S] + 1)
     def _block(self, in_channels, out_channels, kernel_size, stride, padding):
         return nn.Sequential(
             nn.Conv2d(
