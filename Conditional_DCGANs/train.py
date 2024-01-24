@@ -8,20 +8,28 @@ import torchvision.datasets as datasets
 import torchvision.transforms as transforms
 
 from models import Discriminator, Generator, initialize_weights
+from utils import gradient_penalty
 
 # Hyperparamters, etc.
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-LEARNING_RATE = 2e-4
-BATCH_SIZE = 128
-IMAGE_SIZE = 64
+LEARNING_RATE = 1e-4
+BATCH_SIZE = 64
+IMG_SIZE = 64
 CHANNELS_IMG = 1
+NUM_CLASSES = 10
+GEN_EMBEDDING = 100
 Z_DIM = 100
 NUM_EPOCHS = 5
-FEATURES_DISC = 64
+FEATURES_CRITIC = 64
 FEATURES_GEN = 64
+LAMBDA_GP = 10
+
+# WGANS Params
+CRITIC_ITERATIONS = 5
+# WEIGHT_CLIP = 0.01
 
 transform = transforms.Compose([
-    transforms.Resize(IMAGE_SIZE),
+    transforms.Resize(IMG_SIZE),
     transforms.ToTensor(),
     transforms.Normalize(
         [0.5 for _ in range(CHANNELS_IMG)], 
@@ -33,63 +41,72 @@ dataset = datasets.MNIST(root='dataset/', train=True, transform=transform, downl
 loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
 
 # Model Initialization
-gen = Generator(Z_DIM, CHANNELS_IMG, FEATURES_GEN).to(device)
-disc = Discriminator(CHANNELS_IMG, FEATURES_DISC).to(device)
+gen = Generator(Z_DIM, CHANNELS_IMG, FEATURES_GEN, NUM_CLASSES, IMG_SIZE, GEN_EMBEDDING).to(device)
+critic = Discriminator(CHANNELS_IMG, FEATURES_CRITIC, NUM_CLASSES, IMG_SIZE).to(device)
 initialize_weights(gen)
-initialize_weights(disc)
+initialize_weights(critic)
 
-opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
-opt_disc = optim.Adam(disc.parameters(), lr=LEARNING_RATE, betas=(0.5, 0.999))
+# opt_gen = optim.RMSprop(gen.parameters(), lr=LEARNING_RATE)
+# opt_critic = optim.RMSprop(critic.parameters(), lr=LEARNING_RATE)
 
-criterion = nn.BCELoss()
+opt_gen = optim.Adam(gen.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.9))
+opt_critic = optim.Adam(critic.parameters(), lr=LEARNING_RATE, betas=(0.0, 0.9))
 
-fixed_noise = torch.randn(32, Z_DIM, 1, 1).to(device)
+
+fixed_noise = torch.randn(BATCH_SIZE, Z_DIM, 1, 1).to(device)
 writer_real = SummaryWriter(f"logs/real")
 writer_fake = SummaryWriter(f"logs/fake")
 step = 0
 
 gen.train()
-disc.train()
+critic.train()
 
 for epoch in range(NUM_EPOCHS):
-    for batch_idx, (real, _) in enumerate(loader):
+    for batch_idx, (real, labels) in enumerate(loader):
         real = real.to(device)
+        cur_batch_size = real.shape[0]
+        labels = labels.to(device)
 
-        # generate noise
-        noise = torch.randn((BATCH_SIZE, Z_DIM, 1, 1)).to(device)
-        fake = gen(noise)
+        ### Training the Critic, we train this more
+        for _ in range(CRITIC_ITERATIONS):
+             # generate noise
+            noise = torch.randn((BATCH_SIZE, Z_DIM, 1, 1)).to(device)
+            fake = gen(noise, labels)
+            critic_real = critic(real, labels).reshape(-1)
+            critic_fake = critic(fake, labels).reshape(-1)
+            gp = gradient_penalty(critic, labels, real, fake, device=device)
+            loss_critic = (
+                -(torch.mean(critic_real) - torch.mean(critic_fake)) + LAMBDA_GP * gp
+            )
+            critic.zero_grad()
+            loss_critic.backward(retain_graph=True)
+            opt_critic.step()
 
-        ### Train Discriminator max log(D(x)) + log(1 - D(G(z)))
-        disc_real = disc(real).reshape(-1) # N
-        loss_disc_real = criterion(disc_real, torch.ones_like(disc_real))
-        disc_fake = disc(fake).reshape(-1)
-        loss_disc_fake = criterion(disc_fake, torch.zeros_like(disc_fake))
-        loss_disc = (loss_disc_real + loss_disc_fake) * 0.5
-
-        disc.zero_grad()
-        loss_disc.backward()
-
-        ### Train Generator min log(1 - D(G(z))) <---> max log(D(G(z)))
-        output = disc(fake).reshape(-1)
-        loss_gen = criterion(output, torch.ones_like(output))
+            # apply weight clipping
+            # for p in critic.parameters():
+            #     p.data.clamp_(min=-WEIGHT_CLIP, max=WEIGHT_CLIP)
+        
+        ### Train Generator min -E[critic(generator(z))]
+        output = critic(fake, labels).reshape(-1)
+        loss_gen = -torch.mean(output)
         gen.zero_grad()
         loss_gen.backward()
         opt_gen.step()
 
         if batch_idx % 100 == 0:
             print(
-                f"Epoch [{epoch}/{NUM_EPOCHS}] Batch {batch_idx}/{len(loader)} Loss D: {loss_disc:.4f}, Loss G: {loss_gen:.4f}"
+                f"Epoch [{epoch}/{NUM_EPOCHS}] Batch {batch_idx}/{len(loader)} Loss D: {loss_critic:.4f}, Loss G: {loss_gen:.4f}"
             )
 
             with torch.no_grad():
-                fake = gen(fixed_noise)
+                fake = gen(noise, labels)
                 
                 img_grid_real = torchvision.utils.make_grid(
-                    real[:32], normalize=True
+                    real[:BATCH_SIZE], normalize=True
                 )
 
                 img_grid_fake = torchvision.utils.make_grid(
-                    fake[:32], normalize=True
+                    fake[:BATCH_SIZE], normalize=True
                 )
 
                 writer_real.add_image("Real", img_grid_real, global_step=step)
